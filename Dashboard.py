@@ -12,7 +12,8 @@ import feedparser
 from textblob import TextBlob
 import os
 import requests
-import threading # Thư viện chạy ngầm
+import threading
+import random
 
 # --- IMPORT DATA COLLECTOR ---
 try:
@@ -20,97 +21,130 @@ try:
 except ImportError:
     st.error("⚠️ Lỗi: Không tìm thấy module 'CryptoDataCollector'.")
 
-st.set_page_config(page_title="Team 1 - Ultimate Bot", layout="wide", page_icon="💎")
+st.set_page_config(page_title="Team 1 - Pro Terminal", layout="wide", page_icon="💎")
 
 # ==========================================
-# 1. BIẾN TOÀN CỤC CHO BOT NGẦM (GLOBAL STATE)
+# 1. HÀM TÍNH ĐIỂM (SMART SCORING)
 # ==========================================
-# Giữ trạng thái Bot sống mãi dù bạn F5 trang web
-if 'bot_active' not in st.session_state:
-    st.session_state.bot_active = False
+def calculate_confidence(df, direction):
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    score = 50.0 
+    
+    # 1. RSI Dynamic
+    rsi = last['RSI']
+    if direction == "LONG":
+        if rsi < 30: score += (30 - rsi) * 1.5 
+        elif rsi > 50: score -= (rsi - 50) * 0.5
+    elif direction == "SHORT":
+        if rsi > 70: score += (rsi - 70) * 1.5
+        elif rsi < 50: score -= (50 - rsi) * 0.5
+
+    # 2. MACD
+    macd_hist = last['MACD'] - last['Signal_Line']
+    if direction == "LONG":
+        if macd_hist > 0: score += 15 
+        elif macd_hist > prev['MACD'] - prev['Signal_Line']: score += 5
+        else: score -= 10
+    elif direction == "SHORT":
+        if macd_hist < 0: score += 15
+        elif macd_hist < prev['MACD'] - prev['Signal_Line']: score += 5 
+        else: score -= 10
+
+    # 3. Bollinger Bands
+    if direction == "LONG" and last['close'] <= last['Lower_Band']: score += 10
+    elif direction == "SHORT" and last['close'] >= last['Upper_Band']: score += 10
+    
+    # 4. Volume
+    vol_ma = df['volume'].tail(20).mean()
+    if last['volume'] > vol_ma * 1.5: score += 5
+
+    return max(15.0, min(98.5, score))
 
 # ==========================================
-# 2. LOGIC BOT CHẠY NGẦM (BACKGROUND WORKER)
+# 2. BOT NGẦM (BACKGROUND)
 # ==========================================
 def background_bot_logic(symbol, webhook_url):
-    """
-    Hàm này chạy song song với giao diện. 
-    Nó sẽ tự động check thị trường mỗi 15 phút.
-    """
     while True:
         try:
-            # 1. Tự động lấy dữ liệu mới
             CryptoDataCollector.fetch_and_save_data()
             df = pd.read_csv(f"{symbol}_data.csv")
-            
-            # 2. Logic Trade (Dùng RSI + Bollinger Bands để nhẹ máy chủ)
-            # (Lưu ý: Chạy full AI trong background dễ bị tràn RAM server free)
             last = df.iloc[-1]
-            rsi = last['RSI']
-            price = last['close']
             
+            # Logic Bot Ngầm (An toàn)
             signal = None
-            if rsi < 30 and price < last['Lower_Band']:
-                signal = "LONG"
-            elif rsi > 70 and price > last['Upper_Band']:
-                signal = "SHORT"
+            if last['RSI'] < 30: signal = "LONG"
+            elif last['RSI'] > 70: signal = "SHORT"
             
-            # 3. Gửi Discord nếu có tín hiệu
+            # Chỉ gửi nếu có tín hiệu mạnh
             if signal and webhook_url:
+                conf = calculate_confidence(df, signal)
                 color = 5763719 if signal == "LONG" else 15548997
-                embed_data = {
-                    "username": "Team 1 24/7 Bot",
-                    "embeds": [{
-                        "title": f"🔔 AUTO-BOT ALERT: {symbol}",
-                        "description": f"**Signal:** {signal}\n**Price:** ${price:,.2f}\n**RSI:** {rsi:.1f}",
-                        "color": color,
-                        "timestamp": datetime.utcnow().isoformat()
-                    }]
-                }
-                requests.post(webhook_url, json=embed_data)
-                print(f"Đã gửi tín hiệu {signal} lúc {datetime.now()}")
+                
+                # Check file để tránh spam
+                if not os.path.exists("trade_history_v10.csv"):
+                    df_hist = pd.DataFrame(columns=["status"])
+                else:
+                    df_hist = pd.read_csv("trade_history_v10.csv")
+                
+                # Nếu chưa có lệnh Pending thì mới bắn
+                active = df_hist[(df_hist['symbol'] == symbol) & (df_hist['status'] == 'PENDING')]
+                
+                if active.empty:
+                    requests.post(webhook_url, json={
+                        "embeds": [{
+                            "title": f"🔔 AUTO-BOT ALERT: {symbol}",
+                            "description": f"**Signal:** {signal}\n**Price:** ${last['close']}\n**Confidence:** {conf:.1f}%",
+                            "color": color,
+                            "footer": {"text": "Background Service"}
+                        }]
+                    })
             
-            # Nghỉ 15 phút (900 giây)
-            time.sleep(900)
-            
-        except Exception as e:
-            print(f"Lỗi Bot Ngầm: {e}")
-            time.sleep(60) # Lỗi thì nghỉ 1 phút rồi thử lại
+            time.sleep(900) # Nghỉ 15 phút
+        except: time.sleep(60)
 
-# Hàm khởi động luồng
 @st.cache_resource
 def start_background_thread(symbol, webhook):
     t = threading.Thread(target=background_bot_logic, args=(symbol, webhook), daemon=True)
     t.start()
-    return t
 
 # ==========================================
-# 3. CÁC CLASS QUẢN LÝ (Giữ nguyên từ V6)
+# 3. TRADE MANAGER
 # ==========================================
 class TradeManager:
-    FILE_NAME = "trade_history_v8.csv"
+    FILE_NAME = "trade_history_v10.csv"
 
     @staticmethod
     def init_file():
         if not os.path.exists(TradeManager.FILE_NAME):
-            df = pd.DataFrame(columns=["timestamp", "symbol", "type", "entry", "tp", "sl", "status"])
+            df = pd.DataFrame(columns=["timestamp", "symbol", "type", "entry", "tp", "sl", "status", "confidence"])
             df.to_csv(TradeManager.FILE_NAME, index=False)
+            
+    @staticmethod
+    def reset_history():
+        if os.path.exists(TradeManager.FILE_NAME):
+            os.remove(TradeManager.FILE_NAME)
+            TradeManager.init_file()
+            return True
+        return False
 
     @staticmethod
-    def send_discord_embed(webhook_url, symbol, trade_type, entry, tp, sl, timestamp):
+    def send_discord_embed(webhook_url, symbol, trade_type, entry, tp, sl, timestamp, conf):
         if not webhook_url: return
         color = 5763719 if "LONG" in trade_type else 15548997
         title_type = "LONG 📈" if "LONG" in trade_type else "SHORT 📉"
+        quality = "Rất cao 🔥" if conf > 80 else "Trung bình ⚠️" if conf < 50 else "Ổn định ✅"
+        
         embed_data = {
             "username": "Team 1 AI Algo",
             "embeds": [{
                 "title": f"💎 SIGNAL ALERT: {symbol}",
-                "description": "**AI Confidence:** High (94.5%)",
+                "description": f"**AI Confidence:** {conf:.1f}% ({quality})",
                 "color": color,
                 "fields": [
                     {"name": "Direction", "value": f"**{title_type}**", "inline": True},
                     {"name": "Entry", "value": f"`${entry:,.2f}`", "inline": True},
-                    {"name": "TP/SL", "value": f"`${tp:,.2f}` / `${sl:,.2f}`", "inline": True},
+                    {"name": "TP / SL", "value": f"`${tp:,.2f}` / `${sl:,.2f}`", "inline": True},
                     {"name": "Time", "value": f"{timestamp}", "inline": False}
                 ],
                 "footer": {"text": "Team 1 - Institutional System"},
@@ -121,19 +155,26 @@ class TradeManager:
         except: pass
 
     @staticmethod
-    def log_trade(symbol, trade_type, entry, tp, sl, discord_url=None):
+    def log_trade(symbol, trade_type, entry, tp, sl, conf, discord_url=None):
         TradeManager.init_file()
         df = pd.read_csv(TradeManager.FILE_NAME)
+        
+        # --- QUAN TRỌNG: CHỐNG SPAM ---
+        # Nếu đã có lệnh PENDING của coin này -> KHÔNG GỬI NỮA
         active = df[(df['symbol'] == symbol) & (df['status'] == 'PENDING')]
-        if not active.empty: return False 
+        if not active.empty: 
+            return False # Trả về False để báo là không gửi
         
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-        new_row = pd.DataFrame([{"timestamp": now_str, "symbol": symbol, "type": trade_type, "entry": entry, "tp": tp, "sl": sl, "status": "PENDING"}])
+        new_row = pd.DataFrame([{
+            "timestamp": now_str, "symbol": symbol, "type": trade_type, 
+            "entry": entry, "tp": tp, "sl": sl, "status": "PENDING", "confidence": conf
+        }])
         df = pd.concat([df, new_row], ignore_index=True)
         df.to_csv(TradeManager.FILE_NAME, index=False)
 
         if discord_url:
-            TradeManager.send_discord_embed(discord_url, symbol, trade_type, entry, tp, sl, now_str)
+            TradeManager.send_discord_embed(discord_url, symbol, trade_type, entry, tp, sl, now_str, conf)
         return True
 
     @staticmethod
@@ -165,6 +206,9 @@ class TradeManager:
             return (wins/total*100) if total > 0 else 0.0, df
         except: return 0.0, pd.DataFrame()
 
+# ==========================================
+# 4. AI ENGINE
+# ==========================================
 class AIEngine:
     def __init__(self, look_back=60):
         self.look_back = look_back
@@ -195,7 +239,7 @@ class AIEngine:
         X, y = np.array(X), np.array(y)
         
         if 'ai_model' not in st.session_state:
-            with st.spinner("⚙️ Đang khởi động AI..."):
+            with st.spinner("⚙️ AI đang phân tích dữ liệu..."):
                 self.model = self.build_model((self.look_back, 9))
                 self.model.fit(X, y, epochs=epochs, batch_size=32, verbose=0, shuffle=False)
                 st.session_state['ai_model'] = self.model
@@ -206,7 +250,7 @@ class AIEngine:
         return self.close_scaler.inverse_transform(pred)[0][0]
 
 # ==========================================
-# 4. GIAO DIỆN CHÍNH (FRONTEND)
+# 5. GIAO DIỆN CHÍNH
 # ==========================================
 def load_market_data(symbol):
     try:
@@ -239,36 +283,54 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# SIDEBAR
 with st.sidebar:
     st.header("💎 TEAM 1 CONTROL")
-    coin_map = {"Bitcoin": "BTC_USDT", "Ethereum": "ETH_USDT", "BNB": "BNB_USDT"}
+    
+    # 1. DANH SÁCH COIN ĐẦY ĐỦ (Đã thêm lại)
+    coin_map = {
+        "Bitcoin": "BTC_USDT", 
+        "Ethereum": "ETH_USDT", 
+        "BNB": "BNB_USDT",
+        "Solana": "SOL_USDT",
+        "Gold (PAXG)": "PAXG_USDT"
+    }
     symbol = coin_map[st.selectbox("Chọn Tài Sản", list(coin_map.keys()))]
     
     st.divider()
-    
-    st.subheader("🔔 Discord Config")
+    st.subheader("🔔 Discord")
     MY_WEBHOOK = "https://discord.com/api/webhooks/1469612104616251561/SvDfdD1c3GF4evKxTcLCvXGQtPrxrWQBK1BgcpCDh59olo6tQD1zb7ENNHGiFaE0JoBR"
     discord_url = st.text_input("Webhook", value=MY_WEBHOOK, type="password")
     use_discord = st.checkbox("Bật thông báo", value=True)
+    
+    # Nút Test Discord (Mới)
+    if st.button("🔔 TEST KẾT NỐI"):
+        try:
+            requests.post(discord_url, json={"content": "✅ **Test connection from Team 1 Bot successful!**"})
+            st.success("Đã gửi tin nhắn test!")
+        except Exception as e:
+            st.error(f"Lỗi: {e}")
+
+    # Nút Xóa Lịch Sử (Mới)
+    if st.button("🗑️ RESET LỊCH SỬ"):
+        TradeManager.reset_history()
+        st.success("Đã xóa lệnh cũ! Bot sẽ bắn lệnh mới ngay.")
+        time.sleep(1)
+        st.rerun()
 
     st.divider()
-    
-    # NÚT KÍCH HOẠT CHẠY NGẦM
-    st.subheader("☁️ Cloud Automation")
     if st.button("🚀 KÍCH HOẠT BOT 24/7"):
         start_background_thread(symbol, discord_url)
-        st.success("Bot đã chạy ngầm! Bạn có thể tắt Web.")
+        st.success("Bot đã chạy ngầm!")
     
     st.divider()
-    
-    if st.button("⚡ UPDATE DATA (Thủ công)", use_container_width=True):
+    if st.button("⚡ UPDATE DATA", use_container_width=True):
         with st.spinner("Updating..."):
             CryptoDataCollector.fetch_and_save_data()
             if 'ai_model' in st.session_state: del st.session_state['ai_model']
+        st.success("Xong!")
+        time.sleep(0.5)
         st.rerun()
 
-# MAIN SCREEN
 df = load_market_data(symbol)
 
 if df is None:
@@ -281,7 +343,6 @@ else:
     change = ((last['close'] - prev['close']) / prev['close']) * 100
     c_color = "#00E676" if change >= 0 else "#FF5252"
     
-    # KPI
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.markdown(f"<div class='kpi-card'><div class='kpi-label'>Giá</div><div class='kpi-value' style='color:{c_color}'>${last['close']:,.2f}</div></div>", unsafe_allow_html=True)
     c2.markdown(f"<div class='kpi-card'><div class='kpi-label'>Change</div><div class='kpi-value' style='color:{c_color}'>{change:+.2f}%</div></div>", unsafe_allow_html=True)
@@ -291,7 +352,6 @@ else:
     
     st.write("")
 
-    # CHART & AI
     c_chart, c_panel = st.columns([3, 1])
     
     with c_chart:
@@ -314,11 +374,12 @@ else:
     with c_panel:
         ai_placeholder = st.empty()
         try:
-            # AI & Strategy
             engine = AIEngine(look_back=60)
             pred_price = engine.train_and_predict(df, epochs=20)
             
             direction = "LONG" if pred_price > last['close'] else "SHORT"
+            confidence = calculate_confidence(df, direction)
+            
             rsi = last['RSI']
             safe_trade = False
             warning = ""
@@ -339,27 +400,43 @@ else:
                 sl = last['close'] - (1.2 * atr) if direction == "LONG" else last['close'] + (1.2 * atr)
                 
                 webhook = discord_url if use_discord else None
-                sent = TradeManager.log_trade(symbol, direction, last['close'], tp, sl, webhook)
-                status_msg = "✅ Đã gửi tín hiệu Discord" if sent else "⏳ Lệnh đang chạy..."
+                sent = TradeManager.log_trade(symbol, direction, last['close'], tp, sl, confidence, webhook)
+                
+                if sent:
+                    status_msg = "✅ Đã gửi tín hiệu Discord"
+                else:
+                    # NẾU KHÔNG GỬI -> CÓ THỂ DO LỆNH TRÙNG
+                    status_msg = "⛔ Lệnh cũ đang chạy (Spam filter)"
+                
+                conf_color = "#00E676" if confidence > 80 else "#FFD700" if confidence > 50 else "#FF5252"
 
                 html_panel = f"""
-                <div class="signal-box" style="border: 2px solid {color}">
-                    <div style="text-align:center; background:{bg}; color:{color}; font-size:28px; font-weight:900; padding:10px; border-radius:5px; margin-bottom:20px;">{direction}</div>
-                    <div style="text-align:center; font-size:26px; font-weight:bold; color:#FFD700; margin-bottom:20px;">${pred_price:,.2f}</div>
-                    <div class="data-row"><span style="color:#aaa">Entry</span><span style="color:#fff">${last["close"]:,.2f}</span></div>
-                    <div class="data-row"><span style="color:#aaa">TP</span><span style="color:#00E676">${tp:,.2f}</span></div>
-                    <div class="data-row"><span style="color:#aaa">SL</span><span style="color:#FF5252">${sl:,.2f}</span></div>
-                    <div style="text-align:center; font-size:12px; color:#aaa; margin-top:15px;">{status_msg}</div>
-                </div>
-                """
+<div class="signal-box" style="border: 2px solid {color}">
+<div style="text-align:center; background:{bg}; color:{color}; font-size:28px; font-weight:900; padding:10px; border-radius:5px; margin-bottom:10px;">{direction}</div>
+<div style="text-align:center; font-size:26px; font-weight:bold; color:#FFD700; margin-bottom:15px;">${pred_price:,.2f}</div>
+<div style="margin-bottom:15px;">
+<div style="display:flex; justify-content:space-between; font-size:12px; color:#aaa;">
+<span>AI Confidence</span>
+<span style="color:{conf_color}">{confidence:.1f}%</span>
+</div>
+<div style="background:#333; height:8px; border-radius:4px; overflow:hidden;">
+<div style="background:{conf_color}; width:{confidence}%; height:100%;"></div>
+</div>
+</div>
+<div class="data-row"><span style="color:#aaa">Entry</span><span style="color:#fff">${last["close"]:,.2f}</span></div>
+<div class="data-row"><span style="color:#aaa">TP</span><span style="color:#00E676">${tp:,.2f}</span></div>
+<div class="data-row"><span style="color:#aaa">SL</span><span style="color:#FF5252">${sl:,.2f}</span></div>
+<div style="text-align:center; font-size:12px; color:#aaa; margin-top:15px;">{status_msg}</div>
+</div>
+"""
             else:
                 html_panel = f"""
-                <div class="signal-box" style="border: 1px solid #FFD700; opacity:0.7">
-                    <div style="text-align:center; color:#FFD700; font-size:24px; font-weight:bold; margin-bottom:10px;">NO TRADE</div>
-                    <div style="text-align:center; color:#aaa; margin-bottom:20px;">{warning}</div>
-                    <div style="text-align:center; font-size:12px; color:#666;">AI dự đoán {direction} nhưng rủi ro cao.</div>
-                </div>
-                """
+<div class="signal-box" style="border: 1px solid #FFD700; opacity:0.7">
+<div style="text-align:center; color:#FFD700; font-size:24px; font-weight:bold; margin-bottom:10px;">NO TRADE</div>
+<div style="text-align:center; color:#aaa; margin-bottom:20px;">{warning}</div>
+<div style="text-align:center; font-size:12px; color:#666;">AI dự đoán {direction} nhưng rủi ro cao.</div>
+</div>
+"""
             ai_placeholder.markdown(html_panel, unsafe_allow_html=True)
             
         except Exception as e:
