@@ -2,7 +2,7 @@ import streamlit as st
 import time
 
 # --- 1. CẤU HÌNH TRANG ---
-st.set_page_config(page_title="Stable Cast AI", layout="wide", page_icon="🧠")
+st.set_page_config(page_title="Stable Cast Ecosystem", layout="wide", page_icon="💎")
 
 # --- 2. CSS FRONTEND ---
 st.markdown("""
@@ -11,20 +11,40 @@ st.markdown("""
     footer {visibility: hidden;}
     header {visibility: visible !important; background-color: transparent !important;}
     .stApp {background-color: #0E1117;}
+    
+    /* Login & UI */
     .login-container {position: fixed; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 400px; padding: 40px; background: rgba(22, 27, 34, 0.9); border: 1px solid #30363d; border-radius: 16px; text-align: center;}
     .avatar-frame {display: flex; justify-content: center; margin-bottom: 15px;}
-    .avatar-img {width: 120px; height: 120px; border-radius: 50%; object-fit: cover; border: 3px solid #58a6ff; box-shadow: 0 0 15px rgba(88, 166, 255, 0.5);}
+    .avatar-img {width: 100px; height: 100px; border-radius: 50%; object-fit: cover; border: 3px solid #58a6ff; box-shadow: 0 0 15px rgba(88, 166, 255, 0.5);}
+    .stButton > button {border: 1px solid #30363d; font-weight: bold;}
+    
+    /* KPI & Trading */
     .kpi-card {background: #161b22; padding: 15px; border-radius: 6px; border: 1px solid #30363d; text-align: center;}
     .kpi-label {color: #8b949e; font-size: 12px; text-transform: uppercase; font-weight: 600; letter-spacing: 1px; margin-bottom: 5px;}
     .kpi-value {color: #f0f6fc; font-size: 24px; font-weight: 700;}
-    .stButton > button {border: 1px solid #30363d; font-weight: bold;}
-    .stSpinner > div {border-color: #00E676 transparent transparent transparent;}
+    
+    /* Chat Style */
+    .chat-container {height: 500px; overflow-y: auto; padding: 15px; background: #0d1117; border-radius: 10px; border: 1px solid #30363d; margin-bottom: 15px; display: flex; flex-direction: column;}
+    .msg-row {display: flex; margin-bottom: 10px; width: 100%;}
+    .msg-mine {justify-content: flex-end;}
+    .msg-theirs {justify-content: flex-start;}
+    .bubble {padding: 10px 15px; border-radius: 15px; max-width: 70%; font-size: 14px; line-height: 1.4; word-wrap: break-word;}
+    .bubble-mine {background: #1f6feb; color: white; border-bottom-right-radius: 2px;}
+    .bubble-theirs {background: #21262d; color: #e6edf3; border-bottom-left-radius: 2px;}
+    .msg-time {font-size: 10px; color: #8b949e; margin-top: 4px; display: block;}
+    
+    /* News Feed Style */
+    .news-card {background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 15px; margin-bottom: 15px; transition: 0.3s;}
+    .news-card:hover {border-color: #58a6ff;}
+    .news-title {font-size: 16px; font-weight: bold; color: #58a6ff; text-decoration: none;}
+    .news-meta {font-size: 12px; color: #8b949e; margin-top: 5px;}
 </style>
 """, unsafe_allow_html=True)
 
 # --- 3. SESSION & IMPORTS ---
 if 'logged_in' not in st.session_state: st.session_state['logged_in'] = False
 if 'user_info' not in st.session_state: st.session_state['user_info'] = None
+if 'chat_target' not in st.session_state: st.session_state['chat_target'] = None
 
 import pandas as pd
 import numpy as np
@@ -35,7 +55,7 @@ from tensorflow.keras.layers import LSTM, Dense, Dropout, Bidirectional
 from tensorflow.keras.callbacks import EarlyStopping
 import tensorflow as tf
 from datetime import datetime
-import feedparser
+import feedparser # Thư viện lấy tin tức
 from textblob import TextBlob
 import os
 import requests
@@ -50,7 +70,7 @@ try: import CryptoDataCollector
 except ImportError: pass
 
 # ==========================================
-# 4. DATABASE & PROFILE
+# 4. DATABASE
 # ==========================================
 DB_FILE = "stable_cast.db"
 
@@ -61,12 +81,15 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS users (username TEXT PRIMARY KEY, password TEXT, role TEXT, status TEXT)''')
     try: c.execute("ALTER TABLE users ADD COLUMN avatar TEXT"); 
     except: pass
+    c.execute('''CREATE TABLE IF NOT EXISTS friends (user1 TEXT, user2 TEXT, status TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, sender TEXT, receiver TEXT, content TEXT, timestamp TEXT)''')
     try: c.execute("INSERT INTO users (username, password, role, status) VALUES (?, ?, ?, ?)", ("admin", hashlib.sha256("admin123".encode()).hexdigest(), "admin", "active")); conn.commit()
     except: pass
     conn.close()
 
 init_db()
 
+# --- HELPER FUNCTIONS (User, Auth, Social) ---
 def image_to_base64(image):
     buffered = BytesIO(); image.save(buffered, format="PNG"); return base64.b64encode(buffered.getvalue()).decode()
 
@@ -118,59 +141,90 @@ def update_user_status(u, act):
     elif act == "delete": conn.execute("DELETE FROM users WHERE username=?", (u,))
     conn.commit(); conn.close()
 
+# --- SOCIAL LOGIC ---
+class SocialManager:
+    @staticmethod
+    def send_friend_request(from_u, to_u):
+        if from_u == to_u: return "Self?"
+        conn = sqlite3.connect(DB_FILE); c = conn.cursor()
+        c.execute("SELECT * FROM users WHERE username=?", (to_u,))
+        if not c.fetchone(): conn.close(); return "Not found"
+        c.execute("SELECT * FROM friends WHERE (user1=? AND user2=?) OR (user1=? AND user2=?)", (from_u, to_u, to_u, from_u))
+        if c.fetchone(): conn.close(); return "Exists"
+        c.execute("INSERT INTO friends VALUES (?, ?, ?)", (from_u, to_u, "pending")); conn.commit(); conn.close(); return "Sent"
+
+    @staticmethod
+    def accept_friend(user, partner):
+        conn = sqlite3.connect(DB_FILE)
+        conn.execute("UPDATE friends SET status='accepted' WHERE user1=? AND user2=?", (partner, user))
+        conn.commit(); conn.close()
+
+    @staticmethod
+    def get_friends(user):
+        conn = sqlite3.connect(DB_FILE); c = conn.cursor()
+        c.execute("SELECT user1, user2 FROM friends WHERE (user1=? OR user2=?) AND status='accepted'", (user, user))
+        friends = []
+        for row in c.fetchall(): friends.append(row[1] if row[0] == user else row[0])
+        conn.close(); return friends
+
+    @staticmethod
+    def get_requests(user):
+        conn = sqlite3.connect(DB_FILE); c = conn.cursor()
+        c.execute("SELECT user1 FROM friends WHERE user2=? AND status='pending'", (user,))
+        reqs = [r[0] for r in c.fetchall()]; conn.close(); return reqs
+
+    @staticmethod
+    def send_message(sender, receiver, content):
+        if not content: return
+        conn = sqlite3.connect(DB_FILE)
+        ts = datetime.now().strftime("%H:%M")
+        conn.execute("INSERT INTO messages (sender, receiver, content, timestamp) VALUES (?, ?, ?, ?)", (sender, receiver, content, ts))
+        conn.commit(); conn.close()
+
+    @staticmethod
+    def get_messages(u1, u2):
+        conn = sqlite3.connect(DB_FILE)
+        df = pd.read_sql("SELECT * FROM messages WHERE (sender=? AND receiver=?) OR (sender=? AND receiver=?) ORDER BY id ASC", conn, params=(u1, u2, u2, u1))
+        conn.close(); return df
+
+# --- NEWS LOGIC ---
+def get_crypto_news():
+    try:
+        # Lấy tin từ Cointelegraph RSS
+        feed = feedparser.parse("https://cointelegraph.com/rss")
+        return feed.entries[:10] # Lấy 10 tin mới nhất
+    except:
+        return []
+
 # ==========================================
-# 5. AI ENGINE & LOGIC
+# 5. LOGIC CORE (AI + TRADE)
 # ==========================================
 class AIEngine:
     def __init__(self, look_back=60):
-        self.look_back = look_back
-        self.scaler = MinMaxScaler((0,1))
-        self.close_scaler = MinMaxScaler((0,1))
-        self.model = None
-
+        self.look_back = look_back; self.scaler = MinMaxScaler((0,1)); self.close_scaler = MinMaxScaler((0,1)); self.model = None
     def prepare_data(self, df):
-        df['SMA_50'] = df['close'].rolling(window=50).mean().fillna(method='bfill')
-        df['SMA_200'] = df['close'].rolling(window=200).mean().fillna(method='bfill')
+        df['SMA_50'] = df['close'].rolling(50).mean().fillna(method='bfill')
+        df['SMA_200'] = df['close'].rolling(200).mean().fillna(method='bfill')
         data = df[['close', 'high', 'low', 'volume', 'RSI', 'ATR', 'MACD', 'Upper_Band', 'Lower_Band', 'SMA_50', 'SMA_200']].values
-        self.close_scaler.fit(df[['close']])
-        return self.scaler.fit_transform(data)
-
+        self.close_scaler.fit(df[['close']]); return self.scaler.fit_transform(data)
     def build_model(self, input_shape):
-        tf.random.set_seed(42)
-        model = Sequential()
-        model.add(Bidirectional(LSTM(64, return_sequences=True), input_shape=input_shape))
-        model.add(Dropout(0.2))
-        model.add(LSTM(32, return_sequences=False))
-        model.add(Dropout(0.2))
-        model.add(Dense(16, activation='relu'))
-        model.add(Dense(1))
-        model.compile(optimizer='adam', loss='mse')
-        return model
-
+        tf.random.set_seed(42); m = Sequential()
+        m.add(Bidirectional(LSTM(64, return_sequences=True), input_shape=input_shape)); m.add(Dropout(0.2))
+        m.add(LSTM(32, return_sequences=False)); m.add(Dropout(0.2)); m.add(Dense(16, activation='relu')); m.add(Dense(1)); m.compile(optimizer='adam', loss='mse'); return m
     def train_and_predict(self, df, epochs=30):
-        scaled = self.prepare_data(df)
-        X, y = [], []
-        for i in range(self.look_back, len(scaled)):
-            X.append(scaled[i-self.look_back:i])
-            y.append(scaled[i, 0])
+        scaled = self.prepare_data(df); X, y = [], []
+        for i in range(self.look_back, len(scaled)): X.append(scaled[i-self.look_back:i]); y.append(scaled[i, 0])
         X, y = np.array(X), np.array(y)
-        
         if 'ai_model' not in st.session_state:
-            self.model = self.build_model((self.look_back, 11))
-            early_stop = EarlyStopping(monitor='loss', patience=5, restore_best_weights=True)
-            self.model.fit(X, y, epochs=epochs, batch_size=32, verbose=0, shuffle=False, callbacks=[early_stop])
+            self.model = self.build_model((self.look_back, 11)); self.model.fit(X, y, epochs=epochs, batch_size=32, verbose=0, shuffle=False, callbacks=[EarlyStopping('loss', patience=5)])
             st.session_state['ai_model'] = self.model
-        else:
-            self.model = st.session_state['ai_model']
-            
-        last_seq = scaled[-self.look_back:].reshape(1, self.look_back, 11)
-        pred = self.model.predict(last_seq)
+        else: self.model = st.session_state['ai_model']
+        last_seq = scaled[-self.look_back:].reshape(1, self.look_back, 11); pred = self.model.predict(last_seq)
         return self.close_scaler.inverse_transform(pred)[0][0]
 
 class TradeManager:
-    FILE_NAME = "trade_history_v30.csv" # Đổi tên file để tránh lỗi cũ
+    FILE_NAME = "trade_history_v35.csv"
     COOLDOWN_SECONDS = 180
-
     @staticmethod
     def init_file():
         if not os.path.exists(TradeManager.FILE_NAME): pd.DataFrame(columns=["timestamp", "symbol", "type", "entry", "tp", "sl", "status", "confidence", "user"]).to_csv(TradeManager.FILE_NAME, index=False)
@@ -178,24 +232,20 @@ class TradeManager:
     def reset_history():
         if os.path.exists(TradeManager.FILE_NAME): os.remove(TradeManager.FILE_NAME); TradeManager.init_file()
     @staticmethod
-    def log_trade(symbol, trade_type, entry, tp, sl, conf, user, discord_url=None):
+    def log_trade(symbol, trade_type, entry, tp, sl, conf, user, discord_url=None, tp1=None, be_level=None):
         TradeManager.init_file(); df = pd.read_csv(TradeManager.FILE_NAME)
         active = df[(df['symbol'] == symbol) & (df['status'] == 'PENDING') & (df['user'] == user)]
         if not active.empty: return "PENDING"
-        
         user_history = df[(df['symbol'] == symbol) & (df['user'] == user)]
         if not user_history.empty:
             try:
-                last_time = datetime.strptime(user_history.iloc[-1]['timestamp'], "%Y-%m-%d %H:%M")
-                if (datetime.now() - last_time).total_seconds() < TradeManager.COOLDOWN_SECONDS: return "COOLDOWN"
+                if (datetime.now() - datetime.strptime(user_history.iloc[-1]['timestamp'], "%Y-%m-%d %H:%M")).total_seconds() < TradeManager.COOLDOWN_SECONDS: return "COOLDOWN"
             except: pass
-
         new_row = pd.DataFrame([{"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"), "symbol": symbol, "type": trade_type, "entry": entry, "tp": tp, "sl": sl, "status": "PENDING", "confidence": conf, "user": user}])
         df = pd.concat([df, new_row], ignore_index=True); df.to_csv(TradeManager.FILE_NAME, index=False)
-
         if discord_url:
             color = 3447003 if "LONG" in trade_type else 15158332
-            requests.post(discord_url, json={"embeds": [{"title": f"💎 SIGNAL ALERT: {symbol}", "description": f"**Trader:** {user}\n**AI V30 Conf:** {conf:.1f}%", "color": color, "fields": [{"name": "Direction", "value": f"**{trade_type}**", "inline": True}, {"name": "Entry", "value": f"`${entry:,.2f}`", "inline": True}, {"name": "TP / SL", "value": f"`${tp:,.2f}` / `${sl:,.2f}`", "inline": True}]}]})
+            requests.post(discord_url, json={"embeds": [{"title": f"🛡️ SAFE SIGNAL: {symbol}", "description": f"**Trader:** {user}\n**AI Conf:** {conf:.1f}%", "color": color, "fields": [{"name": "Action", "value": f"**{trade_type}** @ `${entry:,.2f}`", "inline": False},{"name": "Targets", "value": f"🎯 **TP1:** `${tp1:,.2f}`\n🚀 **TP2:** `${tp:,.2f}`", "inline": True},{"name": "Safety", "value": f"🛑 **SL:** `${sl:,.2f}`\n⚠️ **Move SL:** `${be_level:,.2f}`", "inline": True}]}]})
         return "SUCCESS"
     @staticmethod
     def audit_trades(market_df, symbol):
@@ -223,27 +273,17 @@ def background_bot_logic(symbol, webhook_url):
     while True:
         try:
             CryptoDataCollector.fetch_and_save_data(); df = pd.read_csv(f"{symbol}_data.csv")
-            df['SMA_50'] = df['close'].rolling(50).mean().fillna(method='bfill')
-            df['SMA_200'] = df['close'].rolling(200).mean().fillna(method='bfill')
+            df['SMA_50'] = df['close'].rolling(50).mean(); df['SMA_200'] = df['close'].rolling(200).mean()
             last = df.iloc[-1]; signal = None
             if last['RSI'] < 30: signal = "LONG"
             elif last['RSI'] > 70: signal = "SHORT"
             if signal and webhook_url:
                 conf = calculate_confidence(df, signal)
-                if not os.path.exists("trade_history_v30.csv"): pd.DataFrame(columns=["status"]).to_csv("trade_history_v30.csv", index=False)
-                df_hist = pd.read_csv("trade_history_v30.csv")
+                if not os.path.exists("trade_history_v35.csv"): pd.DataFrame(columns=["status"]).to_csv("trade_history_v35.csv", index=False)
+                df_hist = pd.read_csv("trade_history_v35.csv")
                 active = df_hist[(df_hist['symbol'] == symbol) & (df_hist['status'] == 'PENDING')]
                 if active.empty:
-                    atr = last['ATR']
-                    # --- SỬA LỖI LOGIC: TÍNH TP/SL CHO BOT NGẦM ---
-                    if signal == "LONG":
-                        tp = last['close'] + (2.5 * atr)
-                        sl = last['close'] - (1.2 * atr)
-                    else: # SHORT
-                        tp = last['close'] - (2.5 * atr)
-                        sl = last['close'] + (1.2 * atr)
-                        
-                    color = 3447003 if signal == "LONG" else 15158332
+                    atr = last['ATR']; tp = last['close'] + (2.5 * atr) if signal == "LONG" else last['close'] - (2.5 * atr); sl = last['close'] - (1.2 * atr) if signal == "LONG" else last['close'] + (1.2 * atr); color = 3447003 if signal == "LONG" else 15158332
                     requests.post(webhook_url, json={"embeds": [{"title": f"🔔 URGENT BOT: {symbol}", "description": f"**Signal:** {signal}\n**Confidence:** {conf:.1f}%", "color": color, "fields": [{"name": "Entry", "value": f"${last['close']:,.2f}", "inline": True}, {"name": "TP / SL", "value": f"${tp:,.2f} / ${sl:,.2f}", "inline": True}]}]})
             time.sleep(900)
         except: time.sleep(60)
@@ -252,15 +292,8 @@ def background_bot_logic(symbol, webhook_url):
 def start_background_thread(symbol, webhook):
     t = threading.Thread(target=background_bot_logic, args=(symbol, webhook), daemon=True); t.start()
 
-def get_news_sentiment():
-    try:
-        feed = feedparser.parse("https://cointelegraph.com/rss"); html = ""; scores = []
-        for entry in feed.entries[:5]: html += f"<div style='border-bottom:1px solid #444; padding:5px;'>▪ {entry.title}</div>"
-        return html, 0
-    except: return "Offline", 0
-
 # ==========================================
-# 6. UI RENDERER
+# 6. UI RENDERER (MAIN)
 # ==========================================
 main_container = st.empty()
 SYSTEM_WEBHOOK = "https://discord.com/api/webhooks/1469612104616251561/SvDfdD1c3GF4evKxTcLCvXGQtPrxrWQBK1BgcpCDh59olo6tQD1zb7ENNHGiFaE0JoBR"
@@ -284,6 +317,77 @@ def render_login():
                     if create_user(nu, np): st.success("SUCCESS"); time.sleep(1)
                     else: st.error("EXISTS")
 
+# --- TRANG: NEWS FEED ---
+def render_news_page():
+    st.header("📰 MARKET NEWS")
+    st.markdown("Tin tức nóng hổi từ Cointelegraph (Cập nhật liên tục)")
+    
+    if st.button("🔄 Refresh News"): st.rerun()
+    
+    news = get_crypto_news()
+    if not news:
+        st.warning("Không tải được tin tức lúc này. Vui lòng thử lại sau.")
+        return
+
+    for item in news:
+        st.markdown(f"""
+        <div class="news-card">
+            <a href="{item.link}" target="_blank" class="news-title">{item.title}</a>
+            <div class="news-meta">{item.published}</div>
+            <div style="font-size:14px; color:#ccc; margin-top:5px;">{item.summary.split('<')[0]}...</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+# --- TRANG: CHAT SOCIAL ---
+def render_social_page(user):
+    st.header("💬 CHAT ROOM")
+    c1, c2 = st.columns([1, 2])
+    
+    with c1:
+        st.subheader("Friends")
+        with st.expander("➕ Add Friend"):
+            target_u = st.text_input("Username", label_visibility="collapsed")
+            if st.button("Send Request"):
+                res = SocialManager.send_friend_request(user, target_u)
+                if res == "Sent": st.success("Sent!")
+                else: st.error(res)
+        
+        reqs = SocialManager.get_requests(user)
+        if reqs:
+            st.info(f"{len(reqs)} Requests")
+            for r in reqs:
+                if st.button(f"Accept {r}", key=f"acc_{r}"):
+                    SocialManager.accept_friend(user, r); st.rerun()
+        
+        friends = SocialManager.get_friends(user)
+        st.write("---")
+        for f in friends:
+            if st.button(f"🟢 {f}", key=f"chat_{f}", use_container_width=True):
+                st.session_state['chat_target'] = f; st.rerun()
+
+    with c2:
+        target = st.session_state['chat_target']
+        if target:
+            st.subheader(f"Chatting with {target}")
+            msgs = SocialManager.get_messages(user, target)
+            
+            # Chat Container
+            html = "<div class='chat-container'>"
+            for _, row in msgs.iterrows():
+                cls = "msg-mine" if row['sender'] == user else "msg-theirs"
+                bbl = "bubble-mine" if row['sender'] == user else "bubble-theirs"
+                html += f"<div class='msg-row {cls}'><div class='bubble {bbl}'>{row['content']}<span class='msg-time'>{row['timestamp']}</span></div></div>"
+            html += "</div>"
+            st.markdown(html, unsafe_allow_html=True)
+            
+            with st.form("chat"):
+                txt = st.text_input("Message", label_visibility="collapsed")
+                if st.form_submit_button("Send 🚀") and txt:
+                    SocialManager.send_message(user, target, txt); st.rerun()
+            if st.button("Refresh Chat"): st.rerun()
+        else: st.info("👈 Select a friend to start chatting")
+
+# --- UI MAIN NAVIGATION ---
 def render_dashboard():
     main_container.empty()
     user, role = st.session_state['user_info']
@@ -293,46 +397,50 @@ def render_dashboard():
     with st.sidebar:
         st.markdown(f"<div class='avatar-frame'><img src='{img_src}' class='avatar-img'></div>", unsafe_allow_html=True)
         st.markdown(f"<h3 style='text-align:center;'>{user}</h3>", unsafe_allow_html=True)
-        st.markdown(f"<p style='text-align:center; color:#888; font-size:12px;'>Role: {role.upper()}</p>", unsafe_allow_html=True)
         
-        with st.expander("👤 Manage Profile"):
-            tab_ava, tab_name, tab_sec = st.tabs(["Avatar", "Name", "Security"])
+        # --- MENU 3 MÓN ---
+        page_mode = st.radio("MENU", ["📈 Trading", "💬 Chat Room", "📰 Market News"], label_visibility="collapsed")
+        st.write("---")
+        
+        with st.expander("👤 Profile"):
+            tab_ava, tab_name, tab_sec = st.tabs(["Avatar", "Name", "Sec"])
             with tab_ava:
-                uploaded = st.file_uploader("Upload", type=['png','jpg'], label_visibility="collapsed")
-                if uploaded and update_avatar(user, uploaded): st.success("Updated!"); time.sleep(1); st.rerun()
+                uploaded = st.file_uploader("Img", type=['png','jpg'])
+                if uploaded and update_avatar(user, uploaded): st.success("OK"); time.sleep(1); st.rerun()
             with tab_name:
-                new_u = st.text_input("New Name", label_visibility="collapsed")
+                new_u = st.text_input("New Name")
                 if st.button("Rename"):
-                    if change_username(user, new_u): st.success("OK! Re-login."); time.sleep(1); st.session_state['logged_in']=False; st.rerun()
-                    else: st.error("Taken")
+                    if change_username(user, new_u): st.session_state['logged_in']=False; st.rerun()
             with tab_sec:
                 old_p = st.text_input("Old Pass", type="password")
                 new_p = st.text_input("New Pass", type="password")
-                if st.button("Update Pass"):
-                    if change_password(user, old_p, new_p): st.success("Success!")
-                    else: st.error("Wrong Old Pass")
-
-        st.divider()
+                if st.button("Update"): 
+                    if change_password(user, old_p, new_p): st.success("OK")
+        
         if st.button("Sign Out"): st.session_state['logged_in'] = False; st.rerun()
         if role == 'admin' and st.checkbox("🛡️ Admin"):
             st.dataframe(get_all_users(), hide_index=True)
-            t = st.selectbox("User", get_all_users()['username'])
-            a = st.selectbox("Act", ["ban", "unban", "delete"])
-            if st.button("Do"): update_user_status(t, a); st.rerun()
             return
 
+    # --- ĐIỀU HƯỚNG TRANG ---
+    if page_mode == "💬 Chat Room":
+        render_social_page(user)
+        return
+    
+    if page_mode == "📰 Market News":
+        render_news_page()
+        return
+
+    # --- TRADING PAGE ---
+    with st.sidebar:
         st.header("💎 ASSETS")
         symbol = st.selectbox("Select", ["BTC_USDT", "ETH_USDT", "BNB_USDT", "SOL_USDT", "PAXG_USDT"])
-        
         wb = SYSTEM_WEBHOOK 
         if role == 'admin':
             wb = st.text_input("Webhook", value=SYSTEM_WEBHOOK, type="password")
-            if st.button("Test"): requests.post(wb, json={"content":"Test OK"})
-            if st.button("Reset"): TradeManager.reset_history()
             if st.button("Bot 24/7"): start_background_thread(symbol, wb)
-        
         if st.button("Update Data"):
-            with st.spinner("Syncing & Training AI V30..."): 
+            with st.spinner("AI V35 Thinking..."): 
                 CryptoDataCollector.fetch_and_save_data()
                 if 'ai_model' in st.session_state: del st.session_state['ai_model']
             st.rerun()
@@ -362,45 +470,37 @@ def render_dashboard():
             eng = AIEngine(60); pred = eng.train_and_predict(df, 30)
             direct = "LONG" if pred > last['close'] else "SHORT"
             conf = calculate_confidence(df, direct)
-            
             safe = (direct=="LONG" and last['RSI']<70) or (direct=="SHORT" and last['RSI']>30) or (conf > 70)
             col_sig = "#00E676" if direct == "LONG" else "#FF5252"
             
             if safe:
                 atr = last['ATR']
-                # --- SỬA LỖI LOGIC: TÍNH TP/SL CHO DASHBOARD ---
-                if direct == "LONG":
-                    tp = last['close'] + (2.5 * atr)
-                    sl = last['close'] - (1.2 * atr)
-                else: # SHORT
-                    tp = last['close'] - (2.5 * atr)
-                    sl = last['close'] + (1.2 * atr)
-                
+                if direct == "LONG": tp=last['close']+(2.5*atr); sl=last['close']-(1.2*atr); tp1=last['close']+(1.2*atr); be_level=last['close']+(0.8*atr)
+                else: tp=last['close']-(2.5*atr); sl=last['close']+(1.2*atr); tp1=last['close']-(1.2*atr); be_level=last['close']-(0.8*atr)
                 conf_color = "#00E676" if conf > 80 else "#FFD700" if conf > 50 else "#FF5252"
                 
                 html = f"""
 <div style="background:#0d1117; border-radius:8px; border:1px solid #30363d; padding:20px; border-top: 3px solid {col_sig}">
 <div style="font-size:32px; font-weight:800; color:{col_sig}; text-align:center;">{direct}</div>
 <div style="text-align:center; color:#888; font-size:12px;">AI Target: ${pred:,.2f}</div>
-<div style="margin:15px 0;">
-<div style="display:flex; justify-content:space-between; font-size:11px; color:#aaa;"><span>AI CONFIDENCE</span><span style="color:{conf_color}">{conf:.1f}%</span></div>
-<div style="background:#333; height:4px; border-radius:2px;"><div style="width:{conf}%; background:{conf_color}; height:100%;"></div></div>
+<div style="margin:15px 0; border:1px dashed #FFD700; background:rgba(255,215,0,0.05); padding:10px; border-radius:5px;">
+    <div style="font-size:11px; color:#FFD700; font-weight:bold; margin-bottom:5px; text-align:center;">🛡️ SAFE PLAN</div>
+    <div style="display:flex; justify-content:space-between; font-size:12px;"><span style="color:#aaa">TP1:</span><span style="color:#fff">${tp1:,.2f}</span></div>
+    <div style="display:flex; justify-content:space-between; font-size:12px;"><span style="color:#aaa">Move SL at:</span><span style="color:#fff">${be_level:,.2f}</span></div>
 </div>
 <div style="display:flex; justify-content:space-between; border-bottom:1px solid #333; padding:5px 0; font-size:13px;"><span style="color:#888">ENTRY</span><span style="color:#fff">${last['close']:,.2f}</span></div>
-<div style="display:flex; justify-content:space-between; border-bottom:1px solid #333; padding:5px 0; font-size:13px;"><span style="color:#888">TP</span><span style="color:#00E676">${tp:,.2f}</span></div>
+<div style="display:flex; justify-content:space-between; border-bottom:1px solid #333; padding:5px 0; font-size:13px;"><span style="color:#888">TP2</span><span style="color:#00E676">${tp:,.2f}</span></div>
 <div style="display:flex; justify-content:space-between; border-bottom:1px solid #333; padding:5px 0; font-size:13px;"><span style="color:#888">SL</span><span style="color:#FF5252">${sl:,.2f}</span></div>
 </div>
 """
                 ai.markdown(html, unsafe_allow_html=True)
-                
-                if st.button("🚀 PUSH ALERT TO DISCORD", use_container_width=True):
-                    status = TradeManager.log_trade(symbol, direct, last['close'], tp, sl, conf, user, wb)
-                    if status == "SUCCESS": st.toast(f"✅ Alert Sent by {user}!", icon="🚀")
-                    elif status == "PENDING": st.toast("⚠️ You already have a pending signal!", icon="🚫")
-                    elif status == "COOLDOWN": st.toast("⏳ Please wait 3 minutes before sending again!", icon="⏱️")
-
+                if st.button("🚀 PUSH TO DISCORD", use_container_width=True):
+                    status = TradeManager.log_trade(symbol, direct, last['close'], tp, sl, conf, user, wb, tp1, be_level)
+                    if status=="SUCCESS": st.toast("Sent!", icon="🚀")
+                    elif status=="PENDING": st.toast("Pending active!", icon="🚫")
+                    elif status=="COOLDOWN": st.toast("Wait 3m!", icon="⏱️")
             else:
-                ai.markdown(f"""<div style="background:#0d1117; padding:20px; text-align:center; border-radius:8px; opacity:0.6"><h3>NO TRADE</h3><p>Risk High / Low Confidence</p></div>""", unsafe_allow_html=True)
+                ai.markdown(f"""<div style="background:#0d1117; padding:20px; text-align:center; border-radius:8px; opacity:0.6"><h3>NO TRADE</h3><p>Risk High</p></div>""", unsafe_allow_html=True)
         except Exception as e: ai.error(f"Error: {e}")
 
 if st.session_state['logged_in']: render_dashboard()
