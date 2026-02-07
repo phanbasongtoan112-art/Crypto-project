@@ -2,7 +2,7 @@ import streamlit as st
 import time
 
 # --- 1. CẤU HÌNH TRANG ---
-st.set_page_config(page_title="Stable Cast", layout="wide", page_icon="💎")
+st.set_page_config(page_title="Stable Cast AI", layout="wide", page_icon="🧠")
 
 # --- 2. CSS FRONTEND ---
 st.markdown("""
@@ -18,6 +18,7 @@ st.markdown("""
     .kpi-label {color: #8b949e; font-size: 12px; text-transform: uppercase; font-weight: 600; letter-spacing: 1px; margin-bottom: 5px;}
     .kpi-value {color: #f0f6fc; font-size: 24px; font-weight: 700;}
     .stButton > button {border: 1px solid #30363d; font-weight: bold;}
+    .stSpinner > div {border-color: #00E676 transparent transparent transparent;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -30,9 +31,10 @@ import numpy as np
 import plotly.graph_objects as go
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
+from tensorflow.keras.layers import LSTM, Dense, Dropout, Bidirectional
+from tensorflow.keras.callbacks import EarlyStopping
 import tensorflow as tf
-from datetime import datetime, timedelta
+from datetime import datetime
 import feedparser
 from textblob import TextBlob
 import os
@@ -48,7 +50,7 @@ try: import CryptoDataCollector
 except ImportError: pass
 
 # ==========================================
-# 4. DATABASE & PROFILE HANDLER
+# 4. DATABASE & PROFILE
 # ==========================================
 DB_FILE = "stable_cast.db"
 
@@ -95,8 +97,7 @@ def change_password(username, old_pass, new_pass):
     if not success: return False
     try:
         new_hash = hashlib.sha256(new_pass.encode()).hexdigest()
-        conn = sqlite3.connect(DB_FILE); conn.execute("UPDATE users SET password=? WHERE username=?", (new_hash, username)); conn.commit(); conn.close()
-        return True
+        conn = sqlite3.connect(DB_FILE); conn.execute("UPDATE users SET password=? WHERE username=?", (new_hash, username)); conn.commit(); conn.close(); return True
     except: return False
 
 def change_username(current_username, new_username):
@@ -118,49 +119,84 @@ def update_user_status(u, act):
     conn.commit(); conn.close()
 
 # ==========================================
-# 5. LOGIC CORE (TRADE MANAGER NÂNG CẤP)
+# 5. AI ENGINE & LOGIC
 # ==========================================
+class AIEngine:
+    def __init__(self, look_back=60):
+        self.look_back = look_back
+        self.scaler = MinMaxScaler((0,1))
+        self.close_scaler = MinMaxScaler((0,1))
+        self.model = None
+
+    def prepare_data(self, df):
+        df['SMA_50'] = df['close'].rolling(window=50).mean().fillna(method='bfill')
+        df['SMA_200'] = df['close'].rolling(window=200).mean().fillna(method='bfill')
+        data = df[['close', 'high', 'low', 'volume', 'RSI', 'ATR', 'MACD', 'Upper_Band', 'Lower_Band', 'SMA_50', 'SMA_200']].values
+        self.close_scaler.fit(df[['close']])
+        return self.scaler.fit_transform(data)
+
+    def build_model(self, input_shape):
+        tf.random.set_seed(42)
+        model = Sequential()
+        model.add(Bidirectional(LSTM(64, return_sequences=True), input_shape=input_shape))
+        model.add(Dropout(0.2))
+        model.add(LSTM(32, return_sequences=False))
+        model.add(Dropout(0.2))
+        model.add(Dense(16, activation='relu'))
+        model.add(Dense(1))
+        model.compile(optimizer='adam', loss='mse')
+        return model
+
+    def train_and_predict(self, df, epochs=30):
+        scaled = self.prepare_data(df)
+        X, y = [], []
+        for i in range(self.look_back, len(scaled)):
+            X.append(scaled[i-self.look_back:i])
+            y.append(scaled[i, 0])
+        X, y = np.array(X), np.array(y)
+        
+        if 'ai_model' not in st.session_state:
+            self.model = self.build_model((self.look_back, 11))
+            early_stop = EarlyStopping(monitor='loss', patience=5, restore_best_weights=True)
+            self.model.fit(X, y, epochs=epochs, batch_size=32, verbose=0, shuffle=False, callbacks=[early_stop])
+            st.session_state['ai_model'] = self.model
+        else:
+            self.model = st.session_state['ai_model']
+            
+        last_seq = scaled[-self.look_back:].reshape(1, self.look_back, 11)
+        pred = self.model.predict(last_seq)
+        return self.close_scaler.inverse_transform(pred)[0][0]
+
 class TradeManager:
-    FILE_NAME = "trade_history_v27.csv"
-    COOLDOWN_SECONDS = 180 # 3 Phút Cooldown
+    FILE_NAME = "trade_history_v30.csv" # Đổi tên file để tránh lỗi cũ
+    COOLDOWN_SECONDS = 180
 
     @staticmethod
     def init_file():
         if not os.path.exists(TradeManager.FILE_NAME): pd.DataFrame(columns=["timestamp", "symbol", "type", "entry", "tp", "sl", "status", "confidence", "user"]).to_csv(TradeManager.FILE_NAME, index=False)
-    
     @staticmethod
     def reset_history():
         if os.path.exists(TradeManager.FILE_NAME): os.remove(TradeManager.FILE_NAME); TradeManager.init_file()
-    
     @staticmethod
     def log_trade(symbol, trade_type, entry, tp, sl, conf, user, discord_url=None):
         TradeManager.init_file(); df = pd.read_csv(TradeManager.FILE_NAME)
-        
-        # 1. CHECK PENDING (Logic cũ) - Một User không được mở 2 lệnh Pending cùng Symbol
         active = df[(df['symbol'] == symbol) & (df['status'] == 'PENDING') & (df['user'] == user)]
         if not active.empty: return "PENDING"
         
-        # 2. CHECK COOLDOWN (Logic Mới) - Tránh Spam bấm liên tục
         user_history = df[(df['symbol'] == symbol) & (df['user'] == user)]
         if not user_history.empty:
-            last_trade_time_str = user_history.iloc[-1]['timestamp']
             try:
-                last_trade_time = datetime.strptime(last_trade_time_str, "%Y-%m-%d %H:%M")
-                time_diff = (datetime.now() - last_trade_time).total_seconds()
-                if time_diff < TradeManager.COOLDOWN_SECONDS:
-                    return "COOLDOWN"
-            except: pass # Nếu lỗi format ngày tháng thì bỏ qua check cooldown
+                last_time = datetime.strptime(user_history.iloc[-1]['timestamp'], "%Y-%m-%d %H:%M")
+                if (datetime.now() - last_time).total_seconds() < TradeManager.COOLDOWN_SECONDS: return "COOLDOWN"
+            except: pass
 
-        # LOGIC GHI DỮ LIỆU
         new_row = pd.DataFrame([{"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"), "symbol": symbol, "type": trade_type, "entry": entry, "tp": tp, "sl": sl, "status": "PENDING", "confidence": conf, "user": user}])
         df = pd.concat([df, new_row], ignore_index=True); df.to_csv(TradeManager.FILE_NAME, index=False)
 
         if discord_url:
             color = 3447003 if "LONG" in trade_type else 15158332
-            requests.post(discord_url, json={"embeds": [{"title": f"💎 SIGNAL ALERT: {symbol}", "description": f"**Trader:** {user}\n**Conf:** {conf:.1f}%", "color": color, "fields": [{"name": "Direction", "value": f"**{trade_type}**", "inline": True}, {"name": "Entry", "value": f"`${entry:,.2f}`", "inline": True}, {"name": "TP / SL", "value": f"`${tp:,.2f}` / `${sl:,.2f}`", "inline": True}]}]})
-        
+            requests.post(discord_url, json={"embeds": [{"title": f"💎 SIGNAL ALERT: {symbol}", "description": f"**Trader:** {user}\n**AI V30 Conf:** {conf:.1f}%", "color": color, "fields": [{"name": "Direction", "value": f"**{trade_type}**", "inline": True}, {"name": "Entry", "value": f"`${entry:,.2f}`", "inline": True}, {"name": "TP / SL", "value": f"`${tp:,.2f}` / `${sl:,.2f}`", "inline": True}]}]})
         return "SUCCESS"
-
     @staticmethod
     def audit_trades(market_df, symbol):
         TradeManager.init_file()
@@ -170,43 +206,44 @@ class TradeManager:
             return 0.0, df 
         except: return 0.0, pd.DataFrame()
 
-class AIEngine:
-    def __init__(self, look_back=60):
-        self.look_back = look_back; self.scaler = MinMaxScaler((0,1)); self.close_scaler = MinMaxScaler((0,1)); self.model = None
-    def prepare_data(self, df):
-        data = df[['close', 'high', 'low', 'volume', 'RSI', 'ATR', 'MACD', 'Upper_Band', 'Lower_Band']].values
-        self.close_scaler.fit(df[['close']]); return self.scaler.fit_transform(data)
-    def build_model(self, input_shape):
-        tf.random.set_seed(42); m = Sequential(); m.add(LSTM(64, return_sequences=False, input_shape=input_shape)); m.add(Dense(32, activation='relu')); m.add(Dense(1)); m.compile(optimizer='adam', loss='mse'); return m
-    def train_and_predict(self, df, epochs=20):
-        scaled = self.prepare_data(df); X, y = [], []
-        for i in range(self.look_back, len(scaled)): X.append(scaled[i-self.look_back:i]); y.append(scaled[i, 0])
-        X, y = np.array(X), np.array(y)
-        if 'ai_model' not in st.session_state:
-            self.model = self.build_model((self.look_back, 9)); self.model.fit(X, y, epochs=epochs, batch_size=32, verbose=0, shuffle=False); st.session_state['ai_model'] = self.model
-        else: self.model = st.session_state['ai_model']
-        last_seq = scaled[-self.look_back:].reshape(1, self.look_back, 9); pred = self.model.predict(last_seq)
-        return self.close_scaler.inverse_transform(pred)[0][0]
-
 def calculate_confidence(df, direction):
     last = df.iloc[-1]; score = 50.0; rsi = last['RSI']
-    if direction == "LONG": score += (30 - rsi)*1.5 if rsi < 30 else 0
-    elif direction == "SHORT": score += (rsi - 70)*1.5 if rsi > 70 else 0
-    return max(15.0, min(98.5, score))
+    sma50 = last.get('SMA_50', last['close']); sma200 = last.get('SMA_200', last['close'])
+    if direction == "LONG":
+        if rsi < 30: score += (30 - rsi)*1.5
+        if last['close'] > sma50: score += 10
+        if sma50 > sma200: score += 5
+    elif direction == "SHORT":
+        if rsi > 70: score += (rsi - 70)*1.5
+        if last['close'] < sma50: score += 10
+        if sma50 < sma200: score += 5
+    return max(15.0, min(99.9, score))
 
 def background_bot_logic(symbol, webhook_url):
     while True:
         try:
-            CryptoDataCollector.fetch_and_save_data(); df = pd.read_csv(f"{symbol}_data.csv"); last = df.iloc[-1]; signal = None
+            CryptoDataCollector.fetch_and_save_data(); df = pd.read_csv(f"{symbol}_data.csv")
+            df['SMA_50'] = df['close'].rolling(50).mean().fillna(method='bfill')
+            df['SMA_200'] = df['close'].rolling(200).mean().fillna(method='bfill')
+            last = df.iloc[-1]; signal = None
             if last['RSI'] < 30: signal = "LONG"
             elif last['RSI'] > 70: signal = "SHORT"
             if signal and webhook_url:
                 conf = calculate_confidence(df, signal)
-                if not os.path.exists("trade_history_v27.csv"): df_hist = pd.DataFrame(columns=["status"])
-                else: df_hist = pd.read_csv("trade_history_v27.csv")
+                if not os.path.exists("trade_history_v30.csv"): pd.DataFrame(columns=["status"]).to_csv("trade_history_v30.csv", index=False)
+                df_hist = pd.read_csv("trade_history_v30.csv")
                 active = df_hist[(df_hist['symbol'] == symbol) & (df_hist['status'] == 'PENDING')]
                 if active.empty:
-                    atr = last['ATR']; tp = last['close'] + (2.5 * atr) if signal == "LONG" else last['close'] - (2.5 * atr); sl = last['close'] - (1.2 * atr) if signal == "LONG" else last['close'] + (1.2 * atr); color = 3447003 if signal == "LONG" else 15158332
+                    atr = last['ATR']
+                    # --- SỬA LỖI LOGIC: TÍNH TP/SL CHO BOT NGẦM ---
+                    if signal == "LONG":
+                        tp = last['close'] + (2.5 * atr)
+                        sl = last['close'] - (1.2 * atr)
+                    else: # SHORT
+                        tp = last['close'] - (2.5 * atr)
+                        sl = last['close'] + (1.2 * atr)
+                        
+                    color = 3447003 if signal == "LONG" else 15158332
                     requests.post(webhook_url, json={"embeds": [{"title": f"🔔 URGENT BOT: {symbol}", "description": f"**Signal:** {signal}\n**Confidence:** {conf:.1f}%", "color": color, "fields": [{"name": "Entry", "value": f"${last['close']:,.2f}", "inline": True}, {"name": "TP / SL", "value": f"${tp:,.2f} / ${sl:,.2f}", "inline": True}]}]})
             time.sleep(900)
         except: time.sleep(60)
@@ -232,7 +269,7 @@ def render_login():
     with main_container.container():
         c1, c2, c3 = st.columns([1, 1, 1])
         with c2:
-            st.markdown("<div style='text-align:center; padding-top:50px;'><h1 style='color:#fff;'>STABLE CAST</h1></div>", unsafe_allow_html=True)
+            st.markdown("<div style='text-align:center; padding-top:50px;'><h1 style='color:#fff;'>STABLE CAST AI</h1></div>", unsafe_allow_html=True)
             tab1, tab2 = st.tabs(["LOGIN", "REGISTER"])
             with tab1:
                 u = st.text_input("Username", key="l_u"); p = st.text_input("Password", type="password", key="l_p")
@@ -295,7 +332,10 @@ def render_dashboard():
             if st.button("Bot 24/7"): start_background_thread(symbol, wb)
         
         if st.button("Update Data"):
-            with st.spinner("Sync..."): CryptoDataCollector.fetch_and_save_data(); st.session_state.pop('ai_model', None); st.rerun()
+            with st.spinner("Syncing & Training AI V30..."): 
+                CryptoDataCollector.fetch_and_save_data()
+                if 'ai_model' in st.session_state: del st.session_state['ai_model']
+            st.rerun()
 
     try: df = pd.read_csv(f"{symbol}_data.csv"); df['timestamp'] = pd.to_datetime(df['timestamp']); df.sort_values('timestamp', inplace=True)
     except: st.info("Need Update."); return
@@ -319,22 +359,31 @@ def render_dashboard():
     with c_panel:
         ai = st.empty()
         try:
-            eng = AIEngine(60); pred = eng.train_and_predict(df, 20)
+            eng = AIEngine(60); pred = eng.train_and_predict(df, 30)
             direct = "LONG" if pred > last['close'] else "SHORT"
             conf = calculate_confidence(df, direct)
-            safe = (direct=="LONG" and last['RSI']<70) or (direct=="SHORT" and last['RSI']>30)
+            
+            safe = (direct=="LONG" and last['RSI']<70) or (direct=="SHORT" and last['RSI']>30) or (conf > 70)
             col_sig = "#00E676" if direct == "LONG" else "#FF5252"
             
             if safe:
-                atr = last['ATR']; tp = last['close']+(2.5*atr); sl = last['close']-(1.2*atr)
+                atr = last['ATR']
+                # --- SỬA LỖI LOGIC: TÍNH TP/SL CHO DASHBOARD ---
+                if direct == "LONG":
+                    tp = last['close'] + (2.5 * atr)
+                    sl = last['close'] - (1.2 * atr)
+                else: # SHORT
+                    tp = last['close'] - (2.5 * atr)
+                    sl = last['close'] + (1.2 * atr)
+                
                 conf_color = "#00E676" if conf > 80 else "#FFD700" if conf > 50 else "#FF5252"
                 
                 html = f"""
 <div style="background:#0d1117; border-radius:8px; border:1px solid #30363d; padding:20px; border-top: 3px solid {col_sig}">
 <div style="font-size:32px; font-weight:800; color:{col_sig}; text-align:center;">{direct}</div>
-<div style="text-align:center; color:#888; font-size:12px;">Target: ${pred:,.2f}</div>
+<div style="text-align:center; color:#888; font-size:12px;">AI Target: ${pred:,.2f}</div>
 <div style="margin:15px 0;">
-<div style="display:flex; justify-content:space-between; font-size:11px; color:#aaa;"><span>CONFIDENCE</span><span style="color:{conf_color}">{conf:.1f}%</span></div>
+<div style="display:flex; justify-content:space-between; font-size:11px; color:#aaa;"><span>AI CONFIDENCE</span><span style="color:{conf_color}">{conf:.1f}%</span></div>
 <div style="background:#333; height:4px; border-radius:2px;"><div style="width:{conf}%; background:{conf_color}; height:100%;"></div></div>
 </div>
 <div style="display:flex; justify-content:space-between; border-bottom:1px solid #333; padding:5px 0; font-size:13px;"><span style="color:#888">ENTRY</span><span style="color:#fff">${last['close']:,.2f}</span></div>
@@ -344,18 +393,14 @@ def render_dashboard():
 """
                 ai.markdown(html, unsafe_allow_html=True)
                 
-                # NÚT BẤM CÓ XỬ LÝ COOLDOWN (ANTI-SPAM)
                 if st.button("🚀 PUSH ALERT TO DISCORD", use_container_width=True):
                     status = TradeManager.log_trade(symbol, direct, last['close'], tp, sl, conf, user, wb)
-                    if status == "SUCCESS":
-                        st.toast(f"✅ Alert Sent by {user}!", icon="🚀")
-                    elif status == "PENDING":
-                        st.toast("⚠️ You already have a pending signal!", icon="🚫")
-                    elif status == "COOLDOWN":
-                        st.toast("⏳ Please wait 3 minutes before sending again!", icon="⏱️")
+                    if status == "SUCCESS": st.toast(f"✅ Alert Sent by {user}!", icon="🚀")
+                    elif status == "PENDING": st.toast("⚠️ You already have a pending signal!", icon="🚫")
+                    elif status == "COOLDOWN": st.toast("⏳ Please wait 3 minutes before sending again!", icon="⏱️")
 
             else:
-                ai.markdown(f"""<div style="background:#0d1117; padding:20px; text-align:center; border-radius:8px; opacity:0.6"><h3>NO TRADE</h3><p>Risk High</p></div>""", unsafe_allow_html=True)
+                ai.markdown(f"""<div style="background:#0d1117; padding:20px; text-align:center; border-radius:8px; opacity:0.6"><h3>NO TRADE</h3><p>Risk High / Low Confidence</p></div>""", unsafe_allow_html=True)
         except Exception as e: ai.error(f"Error: {e}")
 
 if st.session_state['logged_in']: render_dashboard()
