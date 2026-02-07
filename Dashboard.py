@@ -32,7 +32,7 @@ from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense
 import tensorflow as tf
-from datetime import datetime
+from datetime import datetime, timedelta
 import feedparser
 from textblob import TextBlob
 import os
@@ -48,7 +48,7 @@ try: import CryptoDataCollector
 except ImportError: pass
 
 # ==========================================
-# 4. DATABASE & PROFILE HANDLER (MỚI)
+# 4. DATABASE & PROFILE HANDLER
 # ==========================================
 DB_FILE = "stable_cast.db"
 
@@ -65,7 +65,6 @@ def init_db():
 
 init_db()
 
-# --- HÀM XỬ LÝ ẢNH ---
 def image_to_base64(image):
     buffered = BytesIO(); image.save(buffered, format="PNG"); return base64.b64encode(buffered.getvalue()).decode()
 
@@ -78,7 +77,6 @@ def update_avatar(username, image_file):
 def get_user_avatar(username):
     conn = sqlite3.connect(DB_FILE); c = conn.cursor(); c.execute("SELECT avatar FROM users WHERE username=?", (username,)); data = c.fetchone(); conn.close(); return data[0] if data else None
 
-# --- HÀM XỬ LÝ USER (LOGIN, UPDATE PASS, UPDATE NAME) ---
 def check_login(u, p):
     conn = sqlite3.connect(DB_FILE); c = conn.cursor(); c.execute("SELECT password, role, status FROM users WHERE username=?", (u,)); data = c.fetchone(); conn.close()
     if data:
@@ -94,7 +92,7 @@ def create_user(u, p):
 
 def change_password(username, old_pass, new_pass):
     success, _ = check_login(username, old_pass)
-    if not success: return False # Sai mật khẩu cũ
+    if not success: return False
     try:
         new_hash = hashlib.sha256(new_pass.encode()).hexdigest()
         conn = sqlite3.connect(DB_FILE); conn.execute("UPDATE users SET password=? WHERE username=?", (new_hash, username)); conn.commit(); conn.close()
@@ -104,14 +102,9 @@ def change_password(username, old_pass, new_pass):
 def change_username(current_username, new_username):
     try:
         conn = sqlite3.connect(DB_FILE)
-        # Check trùng tên
         cursor = conn.cursor(); cursor.execute("SELECT * FROM users WHERE username=?", (new_username,))
         if cursor.fetchone(): conn.close(); return False
-        
-        # Đổi tên
-        conn.execute("UPDATE users SET username=? WHERE username=?", (new_username, current_username))
-        conn.commit(); conn.close()
-        return True
+        conn.execute("UPDATE users SET username=? WHERE username=?", (new_username, current_username)); conn.commit(); conn.close(); return True
     except: return False
 
 def get_all_users():
@@ -125,29 +118,49 @@ def update_user_status(u, act):
     conn.commit(); conn.close()
 
 # ==========================================
-# 5. LOGIC CORE
+# 5. LOGIC CORE (TRADE MANAGER NÂNG CẤP)
 # ==========================================
 class TradeManager:
-    FILE_NAME = "trade_history_v26.csv"
+    FILE_NAME = "trade_history_v27.csv"
+    COOLDOWN_SECONDS = 180 # 3 Phút Cooldown
+
     @staticmethod
     def init_file():
         if not os.path.exists(TradeManager.FILE_NAME): pd.DataFrame(columns=["timestamp", "symbol", "type", "entry", "tp", "sl", "status", "confidence", "user"]).to_csv(TradeManager.FILE_NAME, index=False)
+    
     @staticmethod
     def reset_history():
         if os.path.exists(TradeManager.FILE_NAME): os.remove(TradeManager.FILE_NAME); TradeManager.init_file()
+    
     @staticmethod
     def log_trade(symbol, trade_type, entry, tp, sl, conf, user, discord_url=None):
         TradeManager.init_file(); df = pd.read_csv(TradeManager.FILE_NAME)
-        active = df[(df['symbol'] == symbol) & (df['status'] == 'PENDING') & (df['user'] == user)]
-        if not active.empty: return False
         
+        # 1. CHECK PENDING (Logic cũ) - Một User không được mở 2 lệnh Pending cùng Symbol
+        active = df[(df['symbol'] == symbol) & (df['status'] == 'PENDING') & (df['user'] == user)]
+        if not active.empty: return "PENDING"
+        
+        # 2. CHECK COOLDOWN (Logic Mới) - Tránh Spam bấm liên tục
+        user_history = df[(df['symbol'] == symbol) & (df['user'] == user)]
+        if not user_history.empty:
+            last_trade_time_str = user_history.iloc[-1]['timestamp']
+            try:
+                last_trade_time = datetime.strptime(last_trade_time_str, "%Y-%m-%d %H:%M")
+                time_diff = (datetime.now() - last_trade_time).total_seconds()
+                if time_diff < TradeManager.COOLDOWN_SECONDS:
+                    return "COOLDOWN"
+            except: pass # Nếu lỗi format ngày tháng thì bỏ qua check cooldown
+
+        # LOGIC GHI DỮ LIỆU
         new_row = pd.DataFrame([{"timestamp": datetime.now().strftime("%Y-%m-%d %H:%M"), "symbol": symbol, "type": trade_type, "entry": entry, "tp": tp, "sl": sl, "status": "PENDING", "confidence": conf, "user": user}])
         df = pd.concat([df, new_row], ignore_index=True); df.to_csv(TradeManager.FILE_NAME, index=False)
 
         if discord_url:
             color = 3447003 if "LONG" in trade_type else 15158332
             requests.post(discord_url, json={"embeds": [{"title": f"💎 SIGNAL ALERT: {symbol}", "description": f"**Trader:** {user}\n**Conf:** {conf:.1f}%", "color": color, "fields": [{"name": "Direction", "value": f"**{trade_type}**", "inline": True}, {"name": "Entry", "value": f"`${entry:,.2f}`", "inline": True}, {"name": "TP / SL", "value": f"`${tp:,.2f}` / `${sl:,.2f}`", "inline": True}]}]})
-        return True
+        
+        return "SUCCESS"
+
     @staticmethod
     def audit_trades(market_df, symbol):
         TradeManager.init_file()
@@ -189,8 +202,8 @@ def background_bot_logic(symbol, webhook_url):
             elif last['RSI'] > 70: signal = "SHORT"
             if signal and webhook_url:
                 conf = calculate_confidence(df, signal)
-                if not os.path.exists("trade_history_v26.csv"): df_hist = pd.DataFrame(columns=["status"])
-                else: df_hist = pd.read_csv("trade_history_v26.csv")
+                if not os.path.exists("trade_history_v27.csv"): df_hist = pd.DataFrame(columns=["status"])
+                else: df_hist = pd.read_csv("trade_history_v27.csv")
                 active = df_hist[(df_hist['symbol'] == symbol) & (df_hist['status'] == 'PENDING')]
                 if active.empty:
                     atr = last['ATR']; tp = last['close'] + (2.5 * atr) if signal == "LONG" else last['close'] - (2.5 * atr); sl = last['close'] - (1.2 * atr) if signal == "LONG" else last['close'] + (1.2 * atr); color = 3447003 if signal == "LONG" else 15158332
@@ -245,28 +258,17 @@ def render_dashboard():
         st.markdown(f"<h3 style='text-align:center;'>{user}</h3>", unsafe_allow_html=True)
         st.markdown(f"<p style='text-align:center; color:#888; font-size:12px;'>Role: {role.upper()}</p>", unsafe_allow_html=True)
         
-        # --- MENU QUẢN LÝ HỒ SƠ ---
         with st.expander("👤 Manage Profile"):
             tab_ava, tab_name, tab_sec = st.tabs(["Avatar", "Name", "Security"])
-            
             with tab_ava:
-                st.caption("Change Profile Picture")
                 uploaded = st.file_uploader("Upload", type=['png','jpg'], label_visibility="collapsed")
                 if uploaded and update_avatar(user, uploaded): st.success("Updated!"); time.sleep(1); st.rerun()
-            
             with tab_name:
-                st.caption("Change Username")
                 new_u = st.text_input("New Name", label_visibility="collapsed")
                 if st.button("Rename"):
-                    if change_username(user, new_u):
-                        st.success("Success! Please Login again.")
-                        time.sleep(1)
-                        st.session_state['logged_in'] = False
-                        st.rerun()
-                    else: st.error("Name Taken")
-
+                    if change_username(user, new_u): st.success("OK! Re-login."); time.sleep(1); st.session_state['logged_in']=False; st.rerun()
+                    else: st.error("Taken")
             with tab_sec:
-                st.caption("Change Password")
                 old_p = st.text_input("Old Pass", type="password")
                 new_p = st.text_input("New Pass", type="password")
                 if st.button("Update Pass"):
@@ -301,7 +303,6 @@ def render_dashboard():
     win, history = TradeManager.audit_trades(df, symbol)
     last = df.iloc[-1]; color = "#00E676"
     
-    # KPI + Labels
     c1,c2,c3,c4 = st.columns(4)
     c1.markdown(f"<div class='kpi-card'><div class='kpi-label'>PRICE</div><div class='kpi-value' style='color:{color}'>${last['close']:,.2f}</div></div>", unsafe_allow_html=True)
     c2.markdown(f"<div class='kpi-card'><div class='kpi-label'>CHANGE</div><div class='kpi-value' style='color:{color}'>+0.5%</div></div>", unsafe_allow_html=True)
@@ -343,11 +344,15 @@ def render_dashboard():
 """
                 ai.markdown(html, unsafe_allow_html=True)
                 
+                # NÚT BẤM CÓ XỬ LÝ COOLDOWN (ANTI-SPAM)
                 if st.button("🚀 PUSH ALERT TO DISCORD", use_container_width=True):
-                    if TradeManager.log_trade(symbol, direct, last['close'], tp, sl, conf, user, wb):
+                    status = TradeManager.log_trade(symbol, direct, last['close'], tp, sl, conf, user, wb)
+                    if status == "SUCCESS":
                         st.toast(f"✅ Alert Sent by {user}!", icon="🚀")
-                    else:
-                        st.toast("⚠️ You already sent this signal!", icon="🚫")
+                    elif status == "PENDING":
+                        st.toast("⚠️ You already have a pending signal!", icon="🚫")
+                    elif status == "COOLDOWN":
+                        st.toast("⏳ Please wait 3 minutes before sending again!", icon="⏱️")
 
             else:
                 ai.markdown(f"""<div style="background:#0d1117; padding:20px; text-align:center; border-radius:8px; opacity:0.6"><h3>NO TRADE</h3><p>Risk High</p></div>""", unsafe_allow_html=True)
